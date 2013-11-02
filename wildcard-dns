@@ -1,0 +1,88 @@
+#!/bin/python
+import sys, socket, re, struct
+
+
+def usage():
+  print """Usage: %s BINDADDR PATTERN TTL
+
+BINDADDR:
+    Address to bind to, such as 212.59.18.25 or dns.myserver.com
+    Use 0.0.0.0 or "" to bind to all addresses available on this machine.
+
+PATTERN:
+    Wildcard pattern with [A].[B].[C].[D] tokens of the IP,
+    as well as optional [IGNORE] token which matches anything.
+
+    eg:
+      [A]-[B]-[C]-[D].ip.test.com       -> 1-2-3-4.ip.test.com -> 1.2.3.4
+      [D]-[A]-[B]-[C].ip.test.com       -> 1-2-3-4.ip.test.com -> 2.3.4.1
+      [A]-[B]-[C]-[D].[IGNORE].test.com -> 1-2-3-4.XX.test.com -> 1.2.3.4
+                                        -> 1-2-3-4.YY.test.com -> 1.2.3.4
+
+    Please note tokens should be UPPERCASE and surrounded by [ and ].
+
+TTL:
+    Time-to-live in seconds
+
+    Other DNS servers will cache the answer for this given period.
+    Increase this value to reduce the amount of requests coming through to
+    your server.
+
+    Maximum value is 4294967295 seconds (~136 years)"""  % sys.argv[0]
+  exit(1)
+
+
+def get_answer(data):
+    domain=''
+    if (ord(data[2]) >> 3) & 15 == 0:
+      start = 12
+      len = ord(data[start])
+      while len != 0:
+        domain += data[start+1:start+len+1]+'.'
+        start += len+1
+        len = ord(data[start])
+
+    match = pattern.match(domain)
+
+    if match:
+      answer = data[:2] + "\x81\x80"
+      answer += data[4:6] + data[4:6] + '\x00\x00\x00\x00' # Questions and Answers Counts
+      answer += data[12:] # Original Domain Name Question
+      answer += '\xc0\x0c' # Pointer to domain name
+      answer += '\x00\x01\x00\x01' + ttl + '\x00\x04' # Response type (2 bytes), class (2 bytes), ttl (4 bytes) and resource data length (2 bytes)
+      answer += ''.join(chr(int(match.group(seg))) for seg in 'ABCD') # 4 bytes of IP
+    else:
+      answer = data[:2] + "\x81\x80"
+      answer += data[4:6] + '\x00\x00\x00\x00\x00\x00' # Questions and Answers Counts
+      answer += data[12:] # Original Domain Name Question
+    return answer
+
+
+if __name__ == '__main__':
+  if len(sys.argv) != 4:
+    usage()
+
+  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  s.bind((sys.argv[1], 53))
+
+  pattern = sys.argv[2].replace('.', '\.')
+  for seg in 'ABCD':
+    if '[%s]' % seg not in pattern:
+      usage()
+    pattern = pattern.replace('[%s]' % seg, '(?P<%s>[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5])' % seg)
+
+  pattern = pattern.replace('[IGNORE]', '(?:.*)')
+  pattern = re.compile('^' + pattern + '\.$', re.I)
+
+  ttl = struct.pack('>i', int(sys.argv[3]))
+
+  while 1:
+    try:
+      data, addr = s.recvfrom(1024)
+      s.sendto(get_answer(data), addr)
+    except KeyboardInterrupt:
+      break
+    except:
+      pass
+
+  s.close()
