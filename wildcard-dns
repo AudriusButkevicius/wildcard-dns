@@ -1,4 +1,7 @@
 #!/bin/python
+from grp import getgrnam
+from os import setgroups, setgid, setuid, umask
+from pwd import getpwnam
 from re import compile, I
 from socket import socket, AF_INET, SOCK_DGRAM, gethostbyaddr, gethostbyname
 from struct import pack
@@ -228,6 +231,12 @@ if __name__ == '__main__':
 
   s = socket(AF_INET, SOCK_DGRAM)
   s.bind((argv[1], 53))
+
+  # Drop priviledges
+  setgroups([])
+  setgid(getgrnam('nogroup').gr_gid)
+  setuid(getpwnam('nobody').pw_uid)
+  umask(077)
 
   pattern = argv[2].replace('.', '\.')
   for seg in 'ABCD':
