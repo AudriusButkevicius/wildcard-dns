@@ -1,13 +1,29 @@
 #!/bin/python
-import sys, socket, re, struct
+from re import compile, I
+from socket import socket, AF_INET, SOCK_DGRAM, gethostbyaddr, gethostbyname
+from struct import pack
+from sys import argv
+from time import time
+
+
+TYPE_A = 1
+TYPE_NS = 2
+TYPE_SOA = 6
+
+
+STATIC = {
+  # 'test.test.com.': '192.168.0.1'
+}
 
 
 def usage():
   print """Usage: %s BINDADDR PATTERN TTL
 
 BINDADDR:
-    Address to bind to, such as 212.59.18.25 or dns.myserver.com
-    Use 0.0.0.0 or "" to bind to all addresses available on this machine.
+    IP or hostname to bind to, such as dns.myserver.com or 123.123.123.123
+    This will also be used as an answer for SOA and NS questions matching
+    the root domain of the pattern domain.
+
 
 PATTERN:
     Wildcard pattern with [A].[B].[C].[D] tokens of the IP,
@@ -28,53 +44,201 @@ TTL:
     Increase this value to reduce the amount of requests coming through to
     your server.
 
-    Maximum value is 4294967295 seconds (~136 years)"""  % sys.argv[0]
+    Maximum value is 4294967295 seconds (~136 years)"""  % argv[0]
   exit(1)
+
+
+def _fix(domain):
+  """
+  Turns:
+  domain.com
+  or
+  domain.com.
+
+  to:
+  domain.com.
+  """
+  if domain == '.':
+    return ''
+  elif domain.endswith('.'):
+    return domain
+  return domain + '.'
+
+
+def _domain(domain):
+  """
+  Turns:
+  www.domain.com
+
+  to:
+  \x03www\x06domain\x03com\x00
+  """
+  return ''.join(chr(len(chunk)) + chunk for chunk in _fix(domain).split('.'))
+
+
+def _ip(ip):
+  """
+  Turns:
+  212.59.18.25
+
+  to:
+  \xd4;\x12\x19
+  """""
+  return ''.join(chr(int(seg)) for seg in ip.split('.'))
+
+
+def _header(qtype, domain='\xc0\x0c'):
+  answer  = domain              # Domain or pointer to domain in the payload
+  answer += pack('>h', qtype)   # Response type
+  answer += '\x00\x01'          # Response class
+  answer += pack('>i', ttl)     # TTL
+  return answer
 
 
 def get_answer(data):
     domain=''
     if (ord(data[2]) >> 3) & 15 == 0:
       start = 12
-      len = ord(data[start])
-      while len != 0:
-        domain += data[start+1:start+len+1]+'.'
-        start += len+1
-        len = ord(data[start])
+      l = ord(data[start])
+      while l != 0:
+        domain += data[start+1:start+l+1]+'.'
+        start += l+1
+        l = ord(data[start])
+
+    qtype = ord(data[-3])
+
+    question_answers = []
+    authority_answers = []
+    additional_answers = []
 
     match = pattern.match(domain)
 
-    if match:
-      answer = data[:2] + "\x81\x80"
-      answer += data[4:6] + data[4:6] + '\x00\x00\x00\x00' # Questions and Answers Counts
-      answer += data[12:] # Original Domain Name Question
-      answer += '\xc0\x0c' # Pointer to domain name
-      answer += '\x00\x01\x00\x01' + ttl + '\x00\x04' # Response type (2 bytes), class (2 bytes), ttl (4 bytes) and resource data length (2 bytes)
-      answer += ''.join(chr(int(match.group(seg))) for seg in 'ABCD') # 4 bytes of IP
-    else:
-      answer = data[:2] + "\x81\x80"
-      answer += data[4:6] + '\x00\x00\x00\x00\x00\x00' # Questions and Answers Counts
-      answer += data[12:] # Original Domain Name Question
-    return answer
+    # Answering questions
+
+    if qtype == TYPE_A:                                             # A record
+      answer  = _header(TYPE_A)
+      answer += pack('>h', 4)                                           # Response length
+      if match:                                                       # Dynamic A record
+        answer += _ip('.'.join(match.group(seg) for seg in 'ABCD'))     # 4 bytes of IP
+      elif domain in STATIC:                                          # Static A record
+        answer += _ip(STATIC[domain])                                   # 4 bytes of IP
+
+      question_answers.append(answer)
+
+    elif qtype == TYPE_NS:                                          # NS record
+      if domain == root:                                              # Our own NS record
+        nsdomain = _domain(hostname)
+        answer  = _header(TYPE_NS, _domain(root))
+        answer += pack('>h', len(nsdomain))                             # Response length
+        answer += nsdomain                                              # NS in charge of domain
+
+        question_answers.append(answer)
+
+      elif domain.endswith(root):                                     # A NS record belonging to our domain which we cannot find
+        answer  = _domain(hostname)                                     # SOA <BINDADDR>
+        answer += _domain('hostmaster.' + hostname)                     # SOA email (hostmaster.<BINDADDR>)
+        answer += pack('>i', started)                                   # Serial timestamp (last modified)
+        answer += pack('>i', 3*60*60)                                   # Refresh interval (3 hours)
+        answer += pack('>i', 1*60*60)                                   # Retry interval (1 hour)
+        answer += pack('>i', 7*24*60*60)                                # Expiration limit (7 days)
+        answer += pack('>i', 1*60*60)                                   # Minimum TTL (1 hour)
+
+        authority_answers.append(_header(TYPE_SOA, _domain(root)) + pack('>h', len(answer)) + answer)
+
+    elif qtype == TYPE_SOA:                                         # SOA record
+      answer  = _domain(hostname)                                       # SOA <BINDADDR>
+      answer += _domain('hostmaster.' + hostname)                       # SOA email (hostmaster.<BINDADDR>)
+      answer += pack('>i', started)                                     # Serial timestamp (last modified)
+      answer += pack('>i', 3*60*60)                                     # Refresh interval (3 hours)
+      answer += pack('>i', 1*60*60)                                     # Retry interval (1 hour)
+      answer += pack('>i', 7*24*60*60)                                  # Expiration limit (7 days)
+      answer += pack('>i', 1*60*60)                                     # Minimum TTL (1 hour)
+      answer = _header(TYPE_SOA, _domain(root)) + pack('>h', len(answer)) + answer
+
+      if domain == root:
+        question_answers.append(answer)
+      elif domain.endswith(root):
+        authority_answers.append(answer)
+
+    # Extra records
+
+    # Add NS record in case it's a A or a SOA answer refering to our domain
+    if qtype in [TYPE_A, TYPE_SOA] and _domain(root) in ''.join(question_answers):
+      answer  = _header(TYPE_NS, _domain(root))
+      answer += pack('>h', len(_domain(hostname)))
+      answer += _domain(hostname)
+
+      authority_answers.append(answer)
+
+    # Add A record in case it's a NS or a SOA answer refering to our domain
+    if qtype in [TYPE_NS, TYPE_SOA] and _domain(root) in ''.join(question_answers):
+      answer  = _header(TYPE_A, _domain(hostname))
+      answer += pack('>h', 4)
+      answer += _ip(ip)
+
+      additional_answers.append(answer)
+
+
+    # If its something from the wrong Opera, send to root nameservers
+
+    if not domain.endswith(root):
+      for rootserver in 'abcdefghijklm':
+        answer  = _header(TYPE_NS, _domain('.'))
+        answer += pack('>h', len(_domain(rootserver + '.root-servers.net')))
+        answer += _domain(rootserver + '.root-servers.net')
+
+        authority_answers.append(answer)
+
+    # Build the final result
+
+    result  = data[:2] + "\x81"                   # Identifier and flags
+
+    if len(question_answers) > 0 or \
+        not domain.endswith(root):                # Status code
+      result += "\x80"                              # NOERROR
+    elif domain.endswith(root):
+      result += "\x83"                              # NXDOMAIN
+
+    result += data[4:6]                           # Question count
+    result += pack('>h', len(question_answers))   # Question answer count
+    result += pack('>h', len(authority_answers))  # Authority record count
+    result += pack('>h', len(additional_answers)) # Additional record count
+    result += data[12:]                           # Original Questions
+
+    for ans in question_answers + authority_answers + additional_answers:
+      result += ans
+
+    return result
 
 
 if __name__ == '__main__':
-  if len(sys.argv) != 4:
+  if len(argv) != 4:
     usage()
 
-  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-  s.bind((sys.argv[1], 53))
+  started = int(time())
 
-  pattern = sys.argv[2].replace('.', '\.')
+  if argv[1].replace('.', '').isdigit():
+    ip = argv[1]
+    hostname = gethostbyaddr(ip)[0]
+  else:
+    hostname = argv[1]
+    ip = gethostbyname(hostname)
+
+  root = '.'.join(_fix(argv[2]).split('.')[-3:])
+
+  s = socket(AF_INET, SOCK_DGRAM)
+  s.bind((argv[1], 53))
+
+  pattern = argv[2].replace('.', '\.')
   for seg in 'ABCD':
     if '[%s]' % seg not in pattern:
       usage()
     pattern = pattern.replace('[%s]' % seg, '(?P<%s>[0-9]{1,2}|1[0-9]{2}|2[0-4][0-9]|25[0-5])' % seg)
 
   pattern = pattern.replace('[IGNORE]', '(?:.*)')
-  pattern = re.compile('^' + pattern + '\.$', re.I)
+  pattern = compile('^' + pattern + '\.$', I)
 
-  ttl = struct.pack('>i', int(sys.argv[3]))
+  ttl = int(argv[3])
 
   while 1:
     try:
@@ -82,7 +246,7 @@ if __name__ == '__main__':
       s.sendto(get_answer(data), addr)
     except KeyboardInterrupt:
       break
-    except:
-      pass
+    except Exception, e:
+      print e
 
   s.close()
