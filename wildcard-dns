@@ -123,64 +123,38 @@ def get_answer(data):
       answer += pack('>h', 4)                                           # Response length
       if match:                                                       # Dynamic A record
         answer += _ip('.'.join(match.group(seg) for seg in 'ABCD'))     # 4 bytes of IP
+        question_answers.append(answer)
       elif domain in STATIC:                                          # Static A record
         answer += _ip(STATIC[domain])                                   # 4 bytes of IP
-
-      question_answers.append(answer)
+        question_answers.append(answer)
+      elif domain.endswith(root):
+        authority_answers.append(OWN_SOA)
 
     elif qtype == TYPE_NS:                                          # NS record
       if domain == root:                                              # Our own NS record
-        nsdomain = _domain(hostname)
-        answer  = _header(TYPE_NS, _domain(root))
-        answer += pack('>h', len(nsdomain))                             # Response length
-        answer += nsdomain                                              # NS in charge of domain
-
-        question_answers.append(answer)
-
+        question_answers.append(OWN_NS)
       elif domain.endswith(root):                                     # A NS record belonging to our domain which we cannot find
-        answer  = _domain(hostname)                                     # SOA <BINDADDR>
-        answer += _domain('hostmaster.' + hostname)                     # SOA email (hostmaster.<BINDADDR>)
-        answer += pack('>i', started)                                   # Serial timestamp (last modified)
-        answer += pack('>i', 3*60*60)                                   # Refresh interval (3 hours)
-        answer += pack('>i', 1*60*60)                                   # Retry interval (1 hour)
-        answer += pack('>i', 7*24*60*60)                                # Expiration limit (7 days)
-        answer += pack('>i', 1*60*60)                                   # Minimum TTL (1 hour)
-
-        authority_answers.append(_header(TYPE_SOA, _domain(root)) + pack('>h', len(answer)) + answer)
+        authority_answers.append(OWN_SOA)
 
     elif qtype == TYPE_SOA:                                         # SOA record
-      answer  = _domain(hostname)                                       # SOA <BINDADDR>
-      answer += _domain('hostmaster.' + hostname)                       # SOA email (hostmaster.<BINDADDR>)
-      answer += pack('>i', started)                                     # Serial timestamp (last modified)
-      answer += pack('>i', 3*60*60)                                     # Refresh interval (3 hours)
-      answer += pack('>i', 1*60*60)                                     # Retry interval (1 hour)
-      answer += pack('>i', 7*24*60*60)                                  # Expiration limit (7 days)
-      answer += pack('>i', 1*60*60)                                     # Minimum TTL (1 hour)
-      answer = _header(TYPE_SOA, _domain(root)) + pack('>h', len(answer)) + answer
-
       if domain == root:
-        question_answers.append(answer)
+        question_answers.append(OWN_SOA)
       elif domain.endswith(root):
-        authority_answers.append(answer)
+        authority_answers.append(OWN_SOA)
 
     # Extra records
 
-    # Add NS record in case it's a A or a SOA answer refering to our domain
-    if qtype in [TYPE_A, TYPE_SOA] and _domain(root) in ''.join(question_answers):
-      answer  = _header(TYPE_NS, _domain(root))
-      answer += pack('>h', len(_domain(hostname)))
-      answer += _domain(hostname)
-
-      authority_answers.append(answer)
-
-    # Add A record in case it's a NS or a SOA answer refering to our domain
-    if qtype in [TYPE_NS, TYPE_SOA] and _domain(root) in ''.join(question_answers):
+    # Add A record in case it's a A, NS or SOA answer refering to our domain
+    if question_answers:
       answer  = _header(TYPE_A, _domain(hostname))
       answer += pack('>h', 4)
       answer += _ip(ip)
 
       additional_answers.append(answer)
 
+      # Add NS record in case it's a A or a SOA answer refering to our domain
+      if qtype != TYPE_NS:
+        authority_answers.append(OWN_NS)
 
     # If its something from the wrong Opera, send to root nameservers
 
@@ -248,6 +222,20 @@ if __name__ == '__main__':
   pattern = compile('^' + pattern + '\.$', I)
 
   ttl = int(argv[3])
+
+  # Construct own NS and own SOA records
+  OWN_SOA  = _domain(hostname)                                       # SOA <BINDADDR>
+  OWN_SOA += _domain('hostmaster.' + hostname)                       # SOA email (hostmaster.<BINDADDR>)
+  OWN_SOA += pack('>i', int(time()))                                 # Serial timestamp (last modified)
+  OWN_SOA += pack('>i', 3*60*60)                                     # Refresh interval (3 hours)
+  OWN_SOA += pack('>i', 1*60*60)                                     # Retry interval (1 hour)
+  OWN_SOA += pack('>i', 7*24*60*60)                                  # Expiration limit (7 days)
+  OWN_SOA += pack('>i', 1*60*60)                                     # Minimum TTL (1 hour)
+  OWN_SOA = _header(TYPE_SOA, _domain(root)) + pack('>h', len(OWN_SOA)) + OWN_SOA
+
+  OWN_NS  = _header(TYPE_NS, _domain(root))
+  OWN_NS += pack('>h', len(_domain(hostname)))
+  OWN_NS += _domain(hostname)
 
   while 1:
     try:
